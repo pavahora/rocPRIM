@@ -25,6 +25,7 @@
 #include <vector>
 #include <limits>
 #include <string>
+#include <type_traits>
 #include <cstdio>
 #include <cstdlib>
 
@@ -64,11 +65,13 @@ namespace rp = rocprim;
 template<
     class T,
     unsigned int BlockSize,
+    unsigned int ItemsPerThread,
     unsigned int Trials
 >
 __global__
 __launch_bounds__(BlockSize)
-void sort_keys_kernel(const T * input, T * output)
+typename std::enable_if<(ItemsPerThread < 2)>::type
+sort_keys_kernel(const T * input, T * output)
 {
     const unsigned int index = (blockIdx.x * BlockSize) + threadIdx.x;
 
@@ -87,11 +90,13 @@ void sort_keys_kernel(const T * input, T * output)
 template<
     class T,
     unsigned int BlockSize,
+    unsigned int ItemsPerThread,
     unsigned int Trials
 >
 __global__
 __launch_bounds__(BlockSize)
-void sort_pairs_kernel(const T * input, T * output)
+typename std::enable_if<(ItemsPerThread < 2)>::type
+sort_pairs_kernel(const T * input, T * output)
 {
     const unsigned int index = (blockIdx.x * BlockSize) + threadIdx.x;
 
@@ -101,7 +106,7 @@ void sort_pairs_kernel(const T * input, T * output)
     ROCPRIM_NO_UNROLL
     for(unsigned int trial = 0; trial < Trials; trial++)
     {
-        rp::block_sort<T, BlockSize, T> bsort;
+        rp::block_sort<T, BlockSize, 1, T> bsort;
         bsort.sort(key, value);
     }
 
@@ -111,12 +116,86 @@ void sort_pairs_kernel(const T * input, T * output)
 template<
     class T,
     unsigned int BlockSize,
+    unsigned int ItemsPerThread,
+    unsigned int Trials
+>
+__global__
+__launch_bounds__(BlockSize)
+typename std::enable_if<!(ItemsPerThread < 2)>::type
+sort_keys_kernel(const T * input, T * output)
+{
+
+    const unsigned int lid = threadIdx.x;
+    const unsigned int block_offset = blockIdx.x * ItemsPerThread * BlockSize;
+
+    T keys[ItemsPerThread];
+    rp::block_load_direct_striped<BlockSize>(lid, input + block_offset, keys);
+
+    ROCPRIM_NO_UNROLL
+    for(unsigned int trial = 0; trial < Trials; trial++)
+    {
+        rp::block_sort<T, BlockSize, ItemsPerThread> bsort;
+        bsort.sort(keys);
+    }
+
+    rp::block_store_direct_blocked(lid, output + block_offset, keys);
+}
+
+template<
+    class T,
+    unsigned int BlockSize,
+    unsigned int ItemsPerThread,
+    unsigned int Trials
+>
+__global__
+__launch_bounds__(BlockSize)
+typename std::enable_if<!(ItemsPerThread < 2)>::type
+sort_pairs_kernel(const T * input, T * output)
+{
+
+    const unsigned int lid = threadIdx.x;
+    const unsigned int block_offset = blockIdx.x * ItemsPerThread * BlockSize;
+
+    T keys[ItemsPerThread];
+    T values[ItemsPerThread];
+    rp::block_load_direct_striped<BlockSize>(lid, input + block_offset, keys);
+
+    ROCPRIM_UNROLL
+    for(unsigned int item = 0; item < ItemsPerThread; ++item) {
+        values[item] = keys[item] + T(1);
+    }
+
+    ROCPRIM_NO_UNROLL
+    for(unsigned int trial = 0; trial < Trials; trial++)
+    {
+        rp::block_sort<T, BlockSize, ItemsPerThread, T> bsort;
+        bsort.sort(keys, values);
+    }
+
+    ROCPRIM_UNROLL
+    for(unsigned int item = 0; item < ItemsPerThread; ++item) {
+        keys[item] = keys[item] + values[item];
+    }
+
+    rp::block_store_direct_blocked(lid, output + block_offset, keys);
+}
+
+template<
+    class T,
+    unsigned int BlockSize,
+    unsigned int ItemsPerThread,
     unsigned int Trials = 10
 >
 void run_benchmark(benchmark::State& state, benchmark_kinds benchmark_kind, hipStream_t stream, size_t N)
 {
     static constexpr auto block_size = BlockSize;
-    const auto size = block_size * ((N + block_size - 1)/block_size);
+    static constexpr auto items_per_block = BlockSize * ItemsPerThread;
+    const auto size = items_per_block * ((N + items_per_block - 1) / items_per_block);
+
+    //std::cerr << "block_size: "      << block_size << '\n';
+    //std::cerr << "items_per_block: " << items_per_block << '\n';
+    //std::cerr << "N: "               << N << '\n';
+    //std::cerr << "size: "            << size << '\n';
 
     std::vector<T> input;
     if(std::is_floating_point<T>::value)
@@ -151,16 +230,16 @@ void run_benchmark(benchmark::State& state, benchmark_kinds benchmark_kind, hipS
         if(benchmark_kind == benchmark_kinds::sort_keys)
         {
             hipLaunchKernelGGL(
-                HIP_KERNEL_NAME(sort_keys_kernel<T, block_size, Trials>),
-                dim3(size/block_size), dim3(block_size), 0, stream,
+                HIP_KERNEL_NAME(sort_keys_kernel<T, block_size, ItemsPerThread, Trials>),
+                dim3(size / items_per_block), dim3(block_size), 0, stream,
                 d_input, d_output
             );
         }
         else if(benchmark_kind == benchmark_kinds::sort_pairs)
         {
             hipLaunchKernelGGL(
-                HIP_KERNEL_NAME(sort_pairs_kernel<T, block_size, Trials>),
-                dim3(size/block_size), dim3(block_size), 0, stream,
+                HIP_KERNEL_NAME(sort_pairs_kernel<T, block_size, ItemsPerThread, Trials>),
+                dim3(size / items_per_block), dim3(block_size), 0, stream,
                 d_input, d_output
             );
         }
@@ -179,12 +258,14 @@ void run_benchmark(benchmark::State& state, benchmark_kinds benchmark_kind, hipS
     HIP_CHECK(hipFree(d_output));
 }
 
-#define CREATE_BENCHMARK(T, BS) \
+#define CREATE_BENCHMARK_ITEMS(T, BS, ITEMS) \
 benchmark::RegisterBenchmark( \
-    (std::string("block_sort<" #T ", " #BS ">.") + name).c_str(), \
-    run_benchmark<T, BS>, \
+    (std::string("block_sort<" #T ", " #BS ", " #ITEMS ">.") + name).c_str(), \
+    run_benchmark<T, BS, ITEMS>, \
     benchmark_kind, stream, size \
 )
+
+#define CREATE_BENCHMARK(T, BS) CREATE_BENCHMARK_ITEMS(T, BS, 1)
 
 void add_benchmarks(benchmark_kinds benchmark_kind,
                     const std::string& name,
@@ -196,12 +277,34 @@ void add_benchmarks(benchmark_kinds benchmark_kind,
     {
         CREATE_BENCHMARK(int, 64),
         CREATE_BENCHMARK(int, 128),
-        CREATE_BENCHMARK(int, 192),
         CREATE_BENCHMARK(int, 256),
-        CREATE_BENCHMARK(int, 320),
         CREATE_BENCHMARK(int, 512),
         CREATE_BENCHMARK(int, 1024),
 
+        CREATE_BENCHMARK_ITEMS(int, 64, 2),
+        CREATE_BENCHMARK_ITEMS(int, 64, 4),
+        CREATE_BENCHMARK_ITEMS(int, 64, 8),
+        //CREATE_BENCHMARK_ITEMS(int, 64, 16),
+        //CREATE_BENCHMARK_ITEMS(int, 64, 32),
+        CREATE_BENCHMARK_ITEMS(int, 128, 2),
+        CREATE_BENCHMARK_ITEMS(int, 128, 4),
+        CREATE_BENCHMARK_ITEMS(int, 128, 8),
+        //CREATE_BENCHMARK_ITEMS(int, 128, 16),
+        //CREATE_BENCHMARK_ITEMS(int, 128, 32),
+        CREATE_BENCHMARK_ITEMS(int, 256, 2),
+        CREATE_BENCHMARK_ITEMS(int, 256, 4),
+        CREATE_BENCHMARK_ITEMS(int, 256, 8),
+        //CREATE_BENCHMARK_ITEMS(int, 256, 16),
+        //CREATE_BENCHMARK_ITEMS(int, 256, 32),
+        CREATE_BENCHMARK_ITEMS(int, 512, 2),
+        CREATE_BENCHMARK_ITEMS(int, 512, 4),
+        CREATE_BENCHMARK_ITEMS(int, 512, 8),
+        //CREATE_BENCHMARK_ITEMS(int, 512, 16),
+        CREATE_BENCHMARK_ITEMS(int, 1024, 2),
+        CREATE_BENCHMARK_ITEMS(int, 1024, 4),
+        CREATE_BENCHMARK_ITEMS(int, 1024, 8)
+
+        /*
         CREATE_BENCHMARK(int8_t, 64),
         CREATE_BENCHMARK(int8_t, 128),
         CREATE_BENCHMARK(int8_t, 192),
@@ -232,7 +335,7 @@ void add_benchmarks(benchmark_kinds benchmark_kind,
         CREATE_BENCHMARK(long long, 256),
         CREATE_BENCHMARK(long long, 320),
         CREATE_BENCHMARK(long long, 512),
-        CREATE_BENCHMARK(long long, 1024)
+        CREATE_BENCHMARK(long long, 1024)*/
     };
 
     benchmarks.insert(benchmarks.end(), bs.begin(), bs.end());
