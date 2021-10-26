@@ -131,11 +131,27 @@ sort_keys_kernel(const T * input, T * output)
     T keys[ItemsPerThread];
     rp::block_load_direct_striped<BlockSize>(lid, input + block_offset, keys);
 
+    using stable_key_type = rocprim::tuple<T, unsigned int>;
+    stable_key_type stable_keys[ItemsPerThread];
+
+    ROCPRIM_UNROLL
+    for(unsigned int item = 0; item < ItemsPerThread; ++item) {
+        stable_keys[item] = rp::make_tuple(keys[item], ItemsPerThread * lid + item);
+    }
+
+    // Special comparison that preserves relative order of equal keys
+    auto stable_compare_function
+        = [](const stable_key_type& a, const stable_key_type& b) mutable -> bool {
+        const bool ab = rp::less<T> {}(rp::get<0>(a), rp::get<0>(b));
+        const bool ba = rp::less<T> {}(rp::get<0>(b), rp::get<0>(a));
+        return ab || (!ba && (rp::get<1>(a) < rp::get<1>(b)));
+    };
+
     ROCPRIM_NO_UNROLL
     for(unsigned int trial = 0; trial < Trials; trial++)
     {
-        rp::block_sort<T, BlockSize, ItemsPerThread> bsort;
-        bsort.sort(keys);
+        rp::block_sort<stable_key_type, BlockSize, ItemsPerThread> bsort;
+        bsort.sort(stable_keys, stable_compare_function);
     }
 
     rp::block_store_direct_blocked(lid, output + block_offset, keys);
