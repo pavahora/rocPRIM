@@ -117,7 +117,7 @@ template<class T, class U, class V>
 inline auto get_random_data(size_t size, U min, V max, size_t max_random_size = 1024 * 1024)
     -> typename std::enable_if<rocprim::is_integral<T>::value, std::vector<T>>::type
 {
-    engine_type gen{std::random_device{}()};
+    engine_type gen{3624422515};
     using dis_type = typename std::conditional<
         is_valid_for_int_distribution<T>::value,
         T,
@@ -142,7 +142,7 @@ template<class T, class U, class V>
 inline auto get_random_data(size_t size, U min, V max, size_t max_random_size = 1024 * 1024)
     -> typename std::enable_if<rocprim::is_floating_point<T>::value, std::vector<T>>::type
 {
-    engine_type gen{std::random_device{}()};
+    engine_type gen{3624422515};
     // Generate floats when T is half
     using dis_type = typename std::conditional<std::is_same<rocprim::half, T>::value, float, T>::type;
     std::uniform_real_distribution<dis_type> distribution((dis_type)min, (dis_type)max);
@@ -161,7 +161,7 @@ inline auto get_random_data(size_t size, U min, V max, size_t max_random_size = 
 template<class T>
 inline std::vector<T> get_random_data01(size_t size, float p, size_t max_random_size = 1024 * 1024)
 {
-    engine_type gen{std::random_device{}()};
+    engine_type gen{3624422515};
     std::bernoulli_distribution distribution(p);
     std::vector<T> data(size);
     std::generate(
