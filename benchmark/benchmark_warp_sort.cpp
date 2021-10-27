@@ -54,21 +54,56 @@ const size_t DEFAULT_N = 1024 * 1024 * 32;
 
 namespace rp = rocprim;
 
-template<class K, unsigned int WarpSize, unsigned int Trials>
+template<class K, unsigned int BlockSize, unsigned int WarpSize, unsigned int ItemsPerThread, unsigned int Trials>
 __global__
-__launch_bounds__(ROCPRIM_DEFAULT_MAX_BLOCK_SIZE)
-void warp_sort_kernel(K* input_key)
+__launch_bounds__(BlockSize)
+void warp_sort_kernel(K* input_key, K* output_key)
 {
-    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int flat_tid = threadIdx.x;
+    const unsigned int items_per_block = BlockSize * ItemsPerThread; 
+    const unsigned int block_offset = blockIdx.x * items_per_block;
 
-    auto key = input_key[i];
-    rp::warp_sort<K, WarpSize> wsort;
-    ROCPRIM_NO_UNROLL
-    for(unsigned int trial = 0; trial < Trials; trial++)
-    {
-        wsort.sort(key);
+    K keys[ItemsPerThread];
+    rp::block_load_direct_blocked(flat_tid, input_key + block_offset, keys);
+
+    //struct stable_key_type {
+    //    K first;
+    //    unsigned int second;
+    //};
+
+    using stable_key_type = rp::tuple<K, unsigned int>;
+
+    const auto stable_compare = [](const stable_key_type& lhs, const stable_key_type& rhs){
+        //bool first  = rp::less<K>{}(lhs.first, rhs.first);
+        //bool second = rp::less<unsigned int>{}(lhs.second, rhs.second);
+        bool first  = rp::less<K>{}(rp::get<0>(lhs), rp::get<0>(rhs));
+        bool second = rp::less<unsigned int>{}(rp::get<1>(lhs), rp::get<1>(rhs));
+        return first && second;
+    };
+
+    stable_key_type stable_keys[ItemsPerThread];
+
+    //const auto lane_id = flat_tid % WarpSize;
+
+    ROCPRIM_UNROLL
+    for(unsigned int item = 0; item < ItemsPerThread; ++item) {
+        //stable_keys[item].first = keys[item];
+        //stable_keys[item].second = 0;
+        stable_keys[item] = rp::make_tuple(keys[item], 0);
     }
-    input_key[i] = key;
+
+    rp::warp_sort<stable_key_type, WarpSize> wsort;
+    wsort.sort(stable_keys, stable_compare);
+    //rp::warp_sort<K, WarpSize> wsort;
+    //wsort.sort(keys);
+
+    ROCPRIM_UNROLL
+    for(unsigned int item = 0; item < ItemsPerThread; ++item) {
+        //keys[item] = stable_keys[item].first;
+        keys[item] = rp::get<0>(stable_keys[item]);
+    }
+
+    rp::block_store_direct_blocked(flat_tid, output_key + block_offset, keys);
 }
 
 template<class K, class V, unsigned int WarpSize, unsigned int Trials>
@@ -112,21 +147,26 @@ template<
     class Key,
     unsigned int BlockSize,
     unsigned int WarpSize,
+    unsigned int ItemsPerThread = 1,
     class Value = Key,
     bool SortByKey = false,
     unsigned int Trials = 100
 >
 void run_benchmark(benchmark::State& state, hipStream_t stream, size_t size)
 {
+    constexpr auto items_per_block = BlockSize * ItemsPerThread;
+
     // Make sure size is a multiple of BlockSize
-    size = BlockSize * ((size + BlockSize - 1)/BlockSize);
+    size = BlockSize * ((size + items_per_block - 1) / items_per_block);
     // Allocate and fill memory
     std::vector<Key> input_key = get_random_data<Key>(size, 0, get_max_value<Key>());
     std::vector<Value> input_value(size_t(1));
     if(SortByKey) input_value = get_random_data<Value>(size, 0, get_max_value<Value>());
     Key * d_input_key = nullptr;
+    Key * d_output_key = nullptr;
     Value * d_input_value = nullptr;
     HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&d_input_key), size * sizeof(Key)));
+    HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&d_output_key), size * sizeof(Key)));
     if(SortByKey) HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&d_input_value), size * sizeof(Value)));
     HIP_CHECK(
         hipMemcpy(
@@ -147,22 +187,24 @@ void run_benchmark(benchmark::State& state, hipStream_t stream, size_t size)
     for(auto _ : state)
     {
         auto start = std::chrono::high_resolution_clock::now();
-        if(SortByKey)
-        {
-            hipLaunchKernelGGL(
-                HIP_KERNEL_NAME(warp_sort_by_key_kernel<Key, Value, WarpSize, Trials>),
-                dim3(size/BlockSize), dim3(BlockSize), 0, stream,
-                d_input_key, d_input_value
-            );
-        }
-        else
-        {
-            hipLaunchKernelGGL(
-                HIP_KERNEL_NAME(warp_sort_kernel<Key, WarpSize, Trials>),
-                dim3(size/BlockSize), dim3(BlockSize), 0, stream,
-                d_input_key
-            );
-        }
+        //if(SortByKey)
+        //{
+        //    hipLaunchKernelGGL(
+        //        HIP_KERNEL_NAME(warp_sort_by_key_kernel<Key, Value, WarpSize, Trials>),
+        //        dim3(size/BlockSize), dim3(BlockSize), 0, stream,
+        //        d_input_key, d_input_value
+        //    );
+        //}
+        //else
+        //{
+            for(unsigned int trial = 0; trial < Trials; ++trial) {
+                hipLaunchKernelGGL(
+                    HIP_KERNEL_NAME(warp_sort_kernel<Key, BlockSize, WarpSize, ItemsPerThread, Trials>),
+                    dim3(size/items_per_block), dim3(BlockSize), 0, stream,
+                    d_input_key, d_output_key
+                );
+            }
+        //}
         HIP_CHECK(hipGetLastError());
         HIP_CHECK(hipDeviceSynchronize());
 
@@ -181,26 +223,35 @@ void run_benchmark(benchmark::State& state, hipStream_t stream, size_t size)
     HIP_CHECK(hipFree(d_input_value));
 }
 
-#define CREATE_SORT_BENCHMARK(K, BS, WS) \
+#define CREATE_SORT_BENCHMARK(K, BS, WS, IPT) \
     benchmark::RegisterBenchmark( \
-        "warp_sort<"#K", "#BS", "#WS">.sort(only keys)", \
-        run_benchmark<K, BS, WS>, \
+        "warp_sort<"#K", "#BS", "#WS", "#IPT">.sort(only keys)", \
+        run_benchmark<K, BS, WS, IPT>, \
         stream, size \
     )
 
 #define CREATE_SORTBYKEY_BENCHMARK(K, V, BS, WS) \
     benchmark::RegisterBenchmark( \
         "warp_sort<"#K", "#BS", "#WS", "#V">.sort", \
-        run_benchmark<K, BS, WS, V, true>, \
+        run_benchmark<K, BS, WS, V, 1, true>, \
         stream, size \
     )
 
 #define BENCHMARK_TYPE(type) \
-    CREATE_SORT_BENCHMARK(type, 64, 64), \
-    CREATE_SORT_BENCHMARK(type, 128, 64), \
-    CREATE_SORT_BENCHMARK(type, 256, 64), \
-    CREATE_SORT_BENCHMARK(type, 64, 32), \
-    CREATE_SORT_BENCHMARK(type, 64, 16)
+    CREATE_SORT_BENCHMARK(type,  64, 64, 1), \
+    CREATE_SORT_BENCHMARK(type,  64, 64, 2), \
+    CREATE_SORT_BENCHMARK(type,  64, 64, 4), \
+    CREATE_SORT_BENCHMARK(type, 128, 64, 1), \
+    CREATE_SORT_BENCHMARK(type, 128, 64, 2), \
+    CREATE_SORT_BENCHMARK(type, 128, 64, 4), \
+    CREATE_SORT_BENCHMARK(type, 256, 64, 1), \
+    CREATE_SORT_BENCHMARK(type, 256, 64, 2), \
+    CREATE_SORT_BENCHMARK(type, 256, 64, 4), \
+    CREATE_SORT_BENCHMARK(type,  64, 32, 1), \
+    CREATE_SORT_BENCHMARK(type,  64, 32, 2), \
+    CREATE_SORT_BENCHMARK(type,  64, 16, 1), \
+    CREATE_SORT_BENCHMARK(type,  64, 16, 2), \
+    CREATE_SORT_BENCHMARK(type,  64, 16, 4)
 
 #define BENCHMARK_KEY_TYPE(type, value) \
     CREATE_SORTBYKEY_BENCHMARK(type, value, 64, 64), \
@@ -226,32 +277,33 @@ int main(int argc, char *argv[])
     HIP_CHECK(hipGetDeviceProperties(&devProp, device_id));
     std::cout << "[HIP] Device name: " << devProp.name << std::endl;
 
-    using custom_double2 = custom_type<double, double>;
-    using custom_int_double = custom_type<int, double>;
-
-    using custom_int2            = custom_type<int, int>;
-    using custom_char_double     = custom_type<char, double>;
-    using custom_longlong_double = custom_type<long long, double>;
+    //using custom_double2 = custom_type<double, double>;
+    //using custom_int_double = custom_type<int, double>;
+//
+    //using custom_int2            = custom_type<int, int>;
+    //using custom_char_double     = custom_type<char, double>;
+    //using custom_longlong_double = custom_type<long long, double>;
 
     std::vector<benchmark::internal::Benchmark*> benchmarks =
     {
         BENCHMARK_TYPE(int),
-        BENCHMARK_TYPE(float),
-        BENCHMARK_TYPE(double),
-        BENCHMARK_TYPE(int8_t),
-        BENCHMARK_TYPE(uint8_t),
-        BENCHMARK_TYPE(rocprim::half),
+        BENCHMARK_TYPE(int64_t)
+        //BENCHMARK_TYPE(float),
+        //BENCHMARK_TYPE(double),
+        //BENCHMARK_TYPE(int8_t),
+        //BENCHMARK_TYPE(uint8_t),
+        //BENCHMARK_TYPE(rocprim::half),
 
-        BENCHMARK_KEY_TYPE(float, float),
-        BENCHMARK_KEY_TYPE(unsigned int, int),
-        BENCHMARK_KEY_TYPE(int, custom_double2),
-        BENCHMARK_KEY_TYPE(int, custom_int_double),
-        BENCHMARK_KEY_TYPE(custom_int2, custom_double2),
-        BENCHMARK_KEY_TYPE(custom_int2, custom_char_double),
-        BENCHMARK_KEY_TYPE(custom_int2, custom_longlong_double),
-        BENCHMARK_KEY_TYPE(int8_t, int8_t),
-        BENCHMARK_KEY_TYPE(uint8_t, uint8_t),
-        BENCHMARK_KEY_TYPE(rocprim::half, rocprim::half)
+        //BENCHMARK_KEY_TYPE(float, float),
+        //BENCHMARK_KEY_TYPE(unsigned int, int),
+        //BENCHMARK_KEY_TYPE(int, custom_double2),
+        //BENCHMARK_KEY_TYPE(int, custom_int_double),
+        //BENCHMARK_KEY_TYPE(custom_int2, custom_double2),
+        //BENCHMARK_KEY_TYPE(custom_int2, custom_char_double),
+        //BENCHMARK_KEY_TYPE(custom_int2, custom_longlong_double),
+        //BENCHMARK_KEY_TYPE(int8_t, int8_t),
+        //BENCHMARK_KEY_TYPE(uint8_t, uint8_t),
+        //BENCHMARK_KEY_TYPE(rocprim::half, rocprim::half)
     };
 
     // Use manual timing
